@@ -5,14 +5,14 @@ export const dynamic = 'force-dynamic';
 interface FFEvent {
   title: string;
   country: string;
-  date: string; // ISO 8601 string
+  date: string;
   impact: string;
   forecast?: string;
   previous?: string;
   actual?: string;
 }
 
-// 1. Helper to clean and parse numeric values (handles K, M, B, %, and negative numbers)
+// Clean and parse economic string values (handles negatives, decimals, K, M, B, %)
 function parseEconValue(raw?: string): number | null {
   if (!raw || raw.trim() === '' || raw.toLowerCase() === 'n/a') return null;
 
@@ -31,7 +31,6 @@ function parseEconValue(raw?: string): number | null {
   return value;
 }
 
-// Inverted metrics where a lower number is positive
 const INVERTED_METRICS = [
   'unemployment',
   'jobless',
@@ -40,7 +39,6 @@ const INVERTED_METRICS = [
   'inventories',
 ];
 
-// 2. Directional badge evaluator
 function formatActualWithDeviation(title: string, actualStr?: string, forecastStr?: string): string {
   if (!actualStr || actualStr.trim() === '') {
     return 'Actual: Pending';
@@ -54,7 +52,7 @@ function formatActualWithDeviation(title: string, actualStr?: string, forecastSt
   }
 
   const diff = actualNum - forecastNum;
-  if (Math.abs(diff) < 0.00001) {
+  if (Math.abs(diff) < 0.0001) {
     return `Actual: ${actualStr} ⚪ In Line`;
   }
 
@@ -76,9 +74,15 @@ export async function GET(req: NextRequest) {
   const shouldGroup = searchParams.get('group') !== 'false';
 
   try {
+    // Cache-buster timestamp ensures fresh data from FairEconomy CDN
+    const ts = Date.now();
     const [thisWeekRes, nextWeekRes] = await Promise.all([
-      fetch('https://nfs.faireconomy.media/ff_calendar_thisweek.json', { next: { revalidate: 300 } }),
-      fetch('https://nfs.faireconomy.media/ff_calendar_nextweek.json', { next: { revalidate: 1800 } }),
+      fetch(`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_t=${ts}`, {
+        cache: 'no-store',
+      }),
+      fetch(`https://nfs.faireconomy.media/ff_calendar_nextweek.json?_t=${ts}`, {
+        cache: 'no-store',
+      }),
     ]);
 
     const thisWeek: FFEvent[] = thisWeekRes.ok ? await thisWeekRes.json() : [];
@@ -132,9 +136,11 @@ export async function GET(req: NextRequest) {
           summary += ` (+${group.events.length - 1} releases)`;
         }
 
-        const uid = `group-${key}@econfeed.local`;
+        const hasActual = group.events.some(e => e.actual && e.actual.trim() !== '');
+        
+        // Critical: changing the UID suffix forces iOS Calendar to replace the event
+        const uid = `group-${key}-${hasActual ? 'act' : 'pend'}@econfeed.local`;
 
-        // Format multi-release description with deviation badges
         const descSections = group.events.map((e, idx) => {
           const impactTag = e.impact.toLowerCase() === 'high' ? '🔴 High' : '🟠 Medium';
           const actualLine = formatActualWithDeviation(e.title, e.actual, e.forecast);
@@ -148,16 +154,12 @@ export async function GET(req: NextRequest) {
 
         const fullDescription = descSections.join('\\n-------------------------\\n');
 
-        // Increments SEQUENCE to force iOS to overwrite previously cached pending entries
-        const hasActual = group.events.some(e => e.actual && e.actual.trim() !== '');
-        const sequenceNumber = hasActual ? 1 : 0;
-
         lines.push(
           'BEGIN:VEVENT',
           `UID:${uid}`,
           `DTSTAMP:${nowIso}`,
           `LAST-MODIFIED:${nowIso}`,
-          `SEQUENCE:${sequenceNumber}`,
+          `SEQUENCE:${hasActual ? 2 : 1}`,
           `DTSTART:${fmt(start)}`,
           `DTEND:${fmt(end)}`,
           `SUMMARY:${summary}`,
@@ -174,7 +176,8 @@ export async function GET(req: NextRequest) {
 
         const end = new Date(start.getTime() + 5 * 60 * 1000);
         const icon = ev.impact.toLowerCase() === 'high' ? '🔴' : '🟠';
-        const uid = `single-${ev.country}-${ev.title}-${start.getTime()}`.replace(/[^a-zA-Z0-9]/g, '_');
+        const hasActual = Boolean(ev.actual && ev.actual.trim() !== '');
+        const uid = `single-${ev.country}-${ev.title}-${start.getTime()}-${hasActual ? 'act' : 'pend'}`.replace(/[^a-zA-Z0-9-]/g, '_');
 
         const actualLine = formatActualWithDeviation(ev.title, ev.actual, ev.forecast);
         const desc = [
@@ -184,15 +187,12 @@ export async function GET(req: NextRequest) {
           actualLine,
         ].join('\\n');
 
-        const hasActual = Boolean(ev.actual && ev.actual.trim() !== '');
-        const sequenceNumber = hasActual ? 1 : 0;
-
         lines.push(
           'BEGIN:VEVENT',
           `UID:${uid}@econfeed.local`,
           `DTSTAMP:${nowIso}`,
           `LAST-MODIFIED:${nowIso}`,
-          `SEQUENCE:${sequenceNumber}`,
+          `SEQUENCE:${hasActual ? 2 : 1}`,
           `DTSTART:${fmt(start)}`,
           `DTEND:${fmt(end)}`,
           `SUMMARY:${icon} [${ev.country}] ${ev.title}`,
@@ -210,7 +210,10 @@ export async function GET(req: NextRequest) {
       headers: {
         'Content-Type': 'text/calendar; charset=utf-8',
         'Content-Disposition': 'inline; filename="calendar.ics"',
-        'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=60',
+        // Prevent all CDN, proxy, and device caches from holding stale data
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+        'Pragma': 'no-cache',
+        'Expires': '0',
       },
     });
   } catch {
