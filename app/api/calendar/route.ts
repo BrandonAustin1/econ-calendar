@@ -2,34 +2,44 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
 
-interface FFEvent {
-  title: string;
+interface FinnhubEvent {
+  actual?: number | null;
+  prev?: number | null;
+  estimate?: number | null;
   country: string;
-  date: string;
+  event: string;
   impact: string;
-  forecast?: string;
-  previous?: string;
-  actual?: string;
+  time: string; // e.g. "2026-09-16 07:00:00"
+  unit?: string;
 }
 
-// Strip units/commas and convert K, M, B, % to raw numbers
-function parseEconValue(raw?: string): number | null {
-  if (!raw || raw.trim() === '' || raw.toLowerCase() === 'n/a') return null;
-
-  const cleaned = raw.replace(/,/g, '').trim();
-  const match = cleaned.match(/^([-+]?[0-9]*\.?[0-9]+)\s*([KkMmBb%]?)/);
-  if (!match) return null;
-
-  let value = parseFloat(match[1]);
-  if (isNaN(value)) return null;
-
-  const suffix = match[2].toUpperCase();
-  if (suffix === 'K') value *= 1_000;
-  if (suffix === 'M') value *= 1_000_000;
-  if (suffix === 'B') value *= 1_000_000_000;
-
-  return value;
+interface NormalizedEvent {
+  title: string;
+  currency: string;
+  date: Date;
+  impact: 'High' | 'Medium' | 'Low';
+  forecast?: number | null;
+  previous?: number | null;
+  actual?: number | null;
+  unit?: string;
 }
+
+const COUNTRY_TO_CURRENCY: Record<string, string> = {
+  US: 'USD',
+  GB: 'GBP',
+  UK: 'GBP',
+  JP: 'JPY',
+  EU: 'EUR',
+  EZ: 'EUR',
+  DE: 'EUR',
+  FR: 'EUR',
+  IT: 'EUR',
+  ES: 'EUR',
+  AU: 'AUD',
+  CA: 'CAD',
+  CH: 'CHF',
+  NZ: 'NZD',
+};
 
 const INVERTED_METRICS = [
   'unemployment',
@@ -39,32 +49,60 @@ const INVERTED_METRICS = [
   'inventories',
 ];
 
-function formatActualWithDeviation(title: string, actualStr?: string, forecastStr?: string): string {
-  if (!actualStr || actualStr.trim() === '') {
+function formatActualWithDeviation(
+  title: string,
+  actual?: number | null,
+  forecast?: number | null,
+  unit?: string,
+  eventDate?: Date
+): string {
+  const unitStr = unit || '';
+
+  // Handle qualitative/speech events with no numerical data
+  if (actual == null && forecast == null) {
+    if (eventDate && Date.now() > eventDate.getTime() + 30 * 60 * 1000) {
+      return 'Status: Completed';
+    }
+    return 'Status: Scheduled';
+  }
+
+  if (actual == null) {
+    if (eventDate && Date.now() > eventDate.getTime()) {
+      return 'Actual: Awaiting Release';
+    }
     return 'Actual: Pending';
   }
 
-  const actualNum = parseEconValue(actualStr);
-  const forecastNum = parseEconValue(forecastStr);
+  const actualDisplay = `${actual}${unitStr}`;
 
-  if (actualNum === null || forecastNum === null) {
-    return `Actual: ${actualStr}`;
+  if (forecast == null) {
+    return `Actual: ${actualDisplay}`;
   }
 
-  const diff = actualNum - forecastNum;
+  const diff = actual - forecast;
   if (Math.abs(diff) < 0.0001) {
-    return `Actual: ${actualStr} ⚪ In Line`;
+    return `Actual: ${actualDisplay} ⚪ In Line`;
   }
 
   const isInverted = INVERTED_METRICS.some(keyword => title.toLowerCase().includes(keyword));
   const isBeat = isInverted ? diff < 0 : diff > 0;
 
-  return isBeat ? `Actual: ${actualStr} 🟢 ⬆️ Beat` : `Actual: ${actualStr} 🔴 ⬇️ Miss`;
+  return isBeat ? `Actual: ${actualDisplay} 🟢 ⬆️ Beat` : `Actual: ${actualDisplay} 🔴 ⬇️ Miss`;
+}
+
+function parseFinnhubTime(timeStr: string): Date {
+  if (!timeStr) return new Date(NaN);
+  const iso = timeStr.includes('T') ? timeStr : timeStr.replace(' ', 'T');
+  return new Date(iso.endsWith('Z') ? iso : `${iso}Z`);
 }
 
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
+  const apiKey = process.env.FINNHUB_API_KEY;
+  if (!apiKey) {
+    return new NextResponse('FINNHUB_API_KEY is not configured in environment variables.', { status: 500 });
+  }
 
+  const { searchParams } = new URL(req.url);
   const currencies = (searchParams.get('currencies') || 'USD,GBP,JPY')
     .toUpperCase()
     .split(',');
@@ -73,37 +111,54 @@ export async function GET(req: NextRequest) {
     .map(i => i.toLowerCase());
   const shouldGroup = searchParams.get('group') !== 'false';
 
+  // Rolling window: 7 days in the past through 10 days in the future
+  const now = new Date();
+  const past = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const future = new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000);
+
+  const fromStr = past.toISOString().split('T')[0];
+  const toStr = future.toISOString().split('T')[0];
+
   try {
-    const fetchHeaders = {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'application/json',
-    };
+    const res = await fetch(
+      `https://finnhub.io/api/v1/calendar/economic?from=${fromStr}&to=${toStr}&token=${apiKey}`,
+      { cache: 'no-store' }
+    );
 
-    // Clean URLs without query parameters to prevent CDN 403s
-    const [thisWeekRes, nextWeekRes] = await Promise.all([
-      fetch('https://nfs.faireconomy.media/ff_calendar_thisweek.json', {
-        headers: fetchHeaders,
-        cache: 'no-store',
-      }),
-      fetch('https://nfs.faireconomy.media/ff_calendar_nextweek.json', {
-        headers: fetchHeaders,
-        cache: 'no-store',
-      }),
-    ]);
-
-    if (!thisWeekRes.ok) {
-      return new NextResponse('Forex Factory upstream unavailable', { status: 502 });
+    if (!res.ok) {
+      return new NextResponse(`Finnhub error: ${res.statusText}`, { status: res.status });
     }
 
-    const thisWeek: FFEvent[] = await thisWeekRes.json();
-    const nextWeek: FFEvent[] = nextWeekRes.ok ? await nextWeekRes.json() : [];
-    const rawEvents = [...thisWeek, ...nextWeek];
+    const data = await res.json();
+    const rawEvents: FinnhubEvent[] = data.economicCalendar || [];
 
-    const filtered = rawEvents.filter(e => {
-      const matchCurr = currencies.includes(e.country?.toUpperCase());
-      const matchImpact = impacts.includes(e.impact?.toLowerCase());
-      return matchCurr && matchImpact;
-    });
+    const normalizedEvents: NormalizedEvent[] = rawEvents
+      .map(e => {
+        let impact: 'High' | 'Medium' | 'Low' = 'Low';
+        const rawImp = (e.impact || '').toLowerCase();
+        if (rawImp === 'high') impact = 'High';
+        else if (rawImp === 'med' || rawImp === 'medium') impact = 'Medium';
+
+        const curr = COUNTRY_TO_CURRENCY[e.country?.toUpperCase()] || e.country?.toUpperCase() || '';
+        const date = parseFinnhubTime(e.time);
+
+        return {
+          title: e.event,
+          currency: curr,
+          date,
+          impact,
+          forecast: e.estimate,
+          previous: e.prev,
+          actual: e.actual,
+          unit: e.unit,
+        };
+      })
+      .filter(e => {
+        const matchCurr = currencies.includes(e.currency);
+        const matchImpact = impacts.includes(e.impact.toLowerCase());
+        const validDate = !isNaN(e.date.getTime());
+        return matchCurr && matchImpact && validDate;
+      });
 
     const lines = [
       'BEGIN:VCALENDAR',
@@ -121,15 +176,12 @@ export async function GET(req: NextRequest) {
     const nowIso = fmt(new Date());
 
     if (shouldGroup) {
-      const groups = new Map<string, { currency: string; date: Date; events: FFEvent[] }>();
+      const groups = new Map<string, { currency: string; date: Date; events: NormalizedEvent[] }>();
 
-      for (const ev of filtered) {
-        const date = new Date(ev.date);
-        if (isNaN(date.getTime())) continue;
-
-        const groupKey = `${ev.country.toUpperCase()}_${date.getTime()}`;
+      for (const ev of normalizedEvents) {
+        const groupKey = `${ev.currency}_${ev.date.getTime()}`;
         if (!groups.has(groupKey)) {
-          groups.set(groupKey, { currency: ev.country.toUpperCase(), date, events: [] });
+          groups.set(groupKey, { currency: ev.currency, date: ev.date, events: [] });
         }
         groups.get(groupKey)!.events.push(ev);
       }
@@ -138,7 +190,7 @@ export async function GET(req: NextRequest) {
         const start = group.date;
         const end = new Date(start.getTime() + 5 * 60 * 1000);
 
-        const hasHigh = group.events.some(e => e.impact.toLowerCase() === 'high');
+        const hasHigh = group.events.some(e => e.impact === 'High');
         const icon = hasHigh ? '🔴' : '🟠';
 
         let summary = `${icon} [${group.currency}] ${group.events[0].title}`;
@@ -146,31 +198,30 @@ export async function GET(req: NextRequest) {
           summary += ` (+${group.events.length - 1} releases)`;
         }
 
-        // PERMANENT STABLE UID: Never changes across requests
-        const uid = `group-${key}@econfeed.local`;
+        const uid = `fh-group-${key}@econfeed.local`;
 
         const descSections = group.events.map((e, idx) => {
-          const impactTag = e.impact.toLowerCase() === 'high' ? '🔴 High' : '🟠 Medium';
-          const actualLine = formatActualWithDeviation(e.title, e.actual, e.forecast);
+          const impactTag = e.impact === 'High' ? '🔴 High' : '🟠 Medium';
+          const actualLine = formatActualWithDeviation(e.title, e.actual, e.forecast, e.unit, e.date);
+          const fcast = e.forecast != null ? `${e.forecast}${e.unit || ''}` : 'N/A';
+          const prev = e.previous != null ? `${e.previous}${e.unit || ''}` : 'N/A';
 
           return [
             `${idx + 1}. ${e.title} [${impactTag}]`,
             `   • ${actualLine}`,
-            `   • Forecast: ${e.forecast || 'N/A'} | Previous: ${e.previous || 'N/A'}`,
+            `   • Forecast: ${fcast} | Previous: ${prev}`,
           ].join('\\n');
         });
 
         const fullDescription = descSections.join('\\n-------------------------\\n');
-
-        // Increment SEQUENCE when actual figures arrive to signal Apple Calendar to update
-        const releasedCount = group.events.filter(e => e.actual && e.actual.trim() !== '').length;
+        const hasActual = group.events.some(e => e.actual != null);
 
         lines.push(
           'BEGIN:VEVENT',
           `UID:${uid}`,
           `DTSTAMP:${nowIso}`,
           `LAST-MODIFIED:${nowIso}`,
-          `SEQUENCE:${releasedCount}`,
+          `SEQUENCE:${hasActual ? 1 : 0}`,
           `DTSTART:${fmt(start)}`,
           `DTEND:${fmt(end)}`,
           `SUMMARY:${summary}`,
@@ -181,33 +232,33 @@ export async function GET(req: NextRequest) {
         );
       }
     } else {
-      for (const ev of filtered) {
-        const start = new Date(ev.date);
-        if (isNaN(start.getTime())) continue;
-
+      for (const ev of normalizedEvents) {
+        const start = ev.date;
         const end = new Date(start.getTime() + 5 * 60 * 1000);
-        const icon = ev.impact.toLowerCase() === 'high' ? '🔴' : '🟠';
-        const uid = `single-${ev.country}-${ev.title}-${start.getTime()}`.replace(/[^a-zA-Z0-9-]/g, '_');
+        const icon = ev.impact === 'High' ? '🔴' : '🟠';
+        const uid = `fh-single-${ev.currency}-${ev.title.toLowerCase().replace(/[^a-z0-9]/g, '')}-${start.getTime()}@econfeed.local`;
 
-        const actualLine = formatActualWithDeviation(ev.title, ev.actual, ev.forecast);
+        const actualLine = formatActualWithDeviation(ev.title, ev.actual, ev.forecast, ev.unit, ev.date);
+        const fcast = ev.forecast != null ? `${ev.forecast}${ev.unit || ''}` : 'N/A';
+        const prev = ev.previous != null ? `${ev.previous}${ev.unit || ''}` : 'N/A';
+
         const desc = [
           `Impact: ${ev.impact}`,
-          `Forecast: ${ev.forecast || 'N/A'}`,
-          `Previous: ${ev.previous || 'N/A'}`,
+          `Currency: ${ev.currency}`,
+          `Forecast: ${fcast}`,
+          `Previous: ${prev}`,
           actualLine,
         ].join('\\n');
 
-        const hasActual = Boolean(ev.actual && ev.actual.trim() !== '');
-
         lines.push(
           'BEGIN:VEVENT',
-          `UID:${uid}@econfeed.local`,
+          `UID:${uid}`,
           `DTSTAMP:${nowIso}`,
           `LAST-MODIFIED:${nowIso}`,
-          `SEQUENCE:${hasActual ? 1 : 0}`,
+          `SEQUENCE:${ev.actual != null ? 1 : 0}`,
           `DTSTART:${fmt(start)}`,
           `DTEND:${fmt(end)}`,
-          `SUMMARY:${icon} [${ev.country}] ${ev.title}`,
+          `SUMMARY:${icon} [${ev.currency}] ${ev.title}`,
           `DESCRIPTION:${desc}`,
           'TRANSP:TRANSPARENT',
           'STATUS:CONFIRMED',
@@ -226,6 +277,6 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err) {
-    return new NextResponse('Calendar feed generation error', { status: 500 });
+    return new NextResponse('Error generating Finnhub calendar feed', { status: 500 });
   }
 }
