@@ -12,7 +12,7 @@ interface FFEvent {
   actual?: string;
 }
 
-// Clean and parse economic string values (handles negatives, decimals, K, M, B, %)
+// Strip units/commas and convert K, M, B, % to raw numbers
 function parseEconValue(raw?: string): number | null {
   if (!raw || raw.trim() === '' || raw.toLowerCase() === 'n/a') return null;
 
@@ -74,18 +74,28 @@ export async function GET(req: NextRequest) {
   const shouldGroup = searchParams.get('group') !== 'false';
 
   try {
-    // Cache-buster timestamp ensures fresh data from FairEconomy CDN
-    const ts = Date.now();
+    const fetchHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json',
+    };
+
+    // Clean URLs without query parameters to prevent CDN 403s
     const [thisWeekRes, nextWeekRes] = await Promise.all([
-      fetch(`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_t=${ts}`, {
+      fetch('https://nfs.faireconomy.media/ff_calendar_thisweek.json', {
+        headers: fetchHeaders,
         cache: 'no-store',
       }),
-      fetch(`https://nfs.faireconomy.media/ff_calendar_nextweek.json?_t=${ts}`, {
+      fetch('https://nfs.faireconomy.media/ff_calendar_nextweek.json', {
+        headers: fetchHeaders,
         cache: 'no-store',
       }),
     ]);
 
-    const thisWeek: FFEvent[] = thisWeekRes.ok ? await thisWeekRes.json() : [];
+    if (!thisWeekRes.ok) {
+      return new NextResponse('Forex Factory upstream unavailable', { status: 502 });
+    }
+
+    const thisWeek: FFEvent[] = await thisWeekRes.json();
     const nextWeek: FFEvent[] = nextWeekRes.ok ? await nextWeekRes.json() : [];
     const rawEvents = [...thisWeek, ...nextWeek];
 
@@ -136,10 +146,8 @@ export async function GET(req: NextRequest) {
           summary += ` (+${group.events.length - 1} releases)`;
         }
 
-        const hasActual = group.events.some(e => e.actual && e.actual.trim() !== '');
-        
-        // Critical: changing the UID suffix forces iOS Calendar to replace the event
-        const uid = `group-${key}-${hasActual ? 'act' : 'pend'}@econfeed.local`;
+        // PERMANENT STABLE UID: Never changes across requests
+        const uid = `group-${key}@econfeed.local`;
 
         const descSections = group.events.map((e, idx) => {
           const impactTag = e.impact.toLowerCase() === 'high' ? '🔴 High' : '🟠 Medium';
@@ -154,12 +162,15 @@ export async function GET(req: NextRequest) {
 
         const fullDescription = descSections.join('\\n-------------------------\\n');
 
+        // Increment SEQUENCE when actual figures arrive to signal Apple Calendar to update
+        const releasedCount = group.events.filter(e => e.actual && e.actual.trim() !== '').length;
+
         lines.push(
           'BEGIN:VEVENT',
           `UID:${uid}`,
           `DTSTAMP:${nowIso}`,
           `LAST-MODIFIED:${nowIso}`,
-          `SEQUENCE:${hasActual ? 2 : 1}`,
+          `SEQUENCE:${releasedCount}`,
           `DTSTART:${fmt(start)}`,
           `DTEND:${fmt(end)}`,
           `SUMMARY:${summary}`,
@@ -176,8 +187,7 @@ export async function GET(req: NextRequest) {
 
         const end = new Date(start.getTime() + 5 * 60 * 1000);
         const icon = ev.impact.toLowerCase() === 'high' ? '🔴' : '🟠';
-        const hasActual = Boolean(ev.actual && ev.actual.trim() !== '');
-        const uid = `single-${ev.country}-${ev.title}-${start.getTime()}-${hasActual ? 'act' : 'pend'}`.replace(/[^a-zA-Z0-9-]/g, '_');
+        const uid = `single-${ev.country}-${ev.title}-${start.getTime()}`.replace(/[^a-zA-Z0-9-]/g, '_');
 
         const actualLine = formatActualWithDeviation(ev.title, ev.actual, ev.forecast);
         const desc = [
@@ -187,12 +197,14 @@ export async function GET(req: NextRequest) {
           actualLine,
         ].join('\\n');
 
+        const hasActual = Boolean(ev.actual && ev.actual.trim() !== '');
+
         lines.push(
           'BEGIN:VEVENT',
           `UID:${uid}@econfeed.local`,
           `DTSTAMP:${nowIso}`,
           `LAST-MODIFIED:${nowIso}`,
-          `SEQUENCE:${hasActual ? 2 : 1}`,
+          `SEQUENCE:${hasActual ? 1 : 0}`,
           `DTSTART:${fmt(start)}`,
           `DTEND:${fmt(end)}`,
           `SUMMARY:${icon} [${ev.country}] ${ev.title}`,
@@ -210,13 +222,10 @@ export async function GET(req: NextRequest) {
       headers: {
         'Content-Type': 'text/calendar; charset=utf-8',
         'Content-Disposition': 'inline; filename="calendar.ics"',
-        // Prevent all CDN, proxy, and device caches from holding stale data
         'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
-        'Pragma': 'no-cache',
-        'Expires': '0',
       },
     });
-  } catch {
+  } catch (err) {
     return new NextResponse('Calendar feed generation error', { status: 500 });
   }
 }
