@@ -8,6 +8,7 @@ export default function Home() {
   const [currencies, setCurrencies] = useState<string[]>(['USD', 'GBP', 'JPY']);
   const [highImpact, setHighImpact] = useState(true);
   const [medImpact, setMedImpact] = useState(true);
+  const [groupEvents, setGroupEvents] = useState(true);
   const [baseUrl, setBaseUrl] = useState('');
   const [copied, setCopied] = useState(false);
 
@@ -26,7 +27,7 @@ export default function Home() {
     medImpact ? 'Medium' : null,
   ].filter(Boolean).join(',');
 
-  const queryParams = `currencies=${currencies.join(',')}&impacts=${impacts}`;
+  const queryParams = `currencies=${currencies.join(',')}&impacts=${impacts}&group=${groupEvents}`;
   const httpsUrl = `${baseUrl}/api/calendar?${queryParams}`;
   const webcalUrl = httpsUrl.replace(/^https?:\/\//, 'webcal://');
 
@@ -42,10 +43,29 @@ export default function Home() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Economic Calendar Feed</h1>
           <p className="text-sm text-neutral-400 mt-1">
-            Subscribe directly on your iOS Calendar for automated 5-minute news alerts.
+            Subscribe directly on iOS Calendar. Events update automatically with actual figures.
           </p>
         </div>
 
+        {/* Grouping Toggle */}
+        <div className="p-4 bg-neutral-950 border border-neutral-800 rounded-xl flex items-center justify-between">
+          <div>
+            <div className="text-sm font-medium text-neutral-200">Group Simultaneous Releases</div>
+            <div className="text-xs text-neutral-400">
+              Merges overlapping drops into 1 event with full stats in the description.
+            </div>
+          </div>
+          <button
+            onClick={() => setGroupEvents(!groupEvents)}
+            className={`w-12 h-6 flex items-center rounded-full p-1 transition duration-300 ${
+              groupEvents ? 'bg-blue-600 justify-end' : 'bg-neutral-700 justify-start'
+            }`}
+          >
+            <div className="bg-white w-4 h-4 rounded-full shadow-md transform" />
+          </button>
+        </div>
+
+        {/* Impact Toggles */}
         <div className="space-y-3">
           <label className="text-xs uppercase tracking-wider text-neutral-400 font-semibold">
             Folder Impact
@@ -74,9 +94,10 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Currency Selection */}
         <div className="space-y-3">
           <label className="text-xs uppercase tracking-wider text-neutral-400 font-semibold">
-            Currencies
+            Target Currencies
           </label>
           <div className="grid grid-cols-4 gap-2">
             {ALL_CURRENCIES.map(curr => {
@@ -98,6 +119,7 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Subscription Links */}
         <div className="pt-4 border-t border-neutral-800 space-y-3">
           <a
             href={webcalUrl}
